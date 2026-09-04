@@ -25,7 +25,8 @@ TUBE_CAPACITY = 4                       # balls per color / per full tube
 EMPTY_TUBES = 2                         # spare empty tubes per level (classic ball-sort difficulty)
 PINCH_START_RATIO = 0.35  # Threshold to engage pinch (in isotropic camera space)
 PINCH_END_RATIO = 0.48    # Threshold to release pinch (hysteresis deadband: 0.35 - 0.48)
-DROP_ANIM_MS = 180
+DROP_ANIM_MS = 220
+RETURN_ANIM_MS = 360
 LEVEL_INTRO_ANIM_MS = 420   # staggered ball "drop-in" animation duration when a level loads
 CONFETTI_COUNT = 90         # celebratory particles spawned once when a level is won
 
@@ -216,6 +217,9 @@ class CameraStream:
             if ok:
                 with self._lock:
                     self._frame = frame
+            else:
+                time.sleep(0.01)
+            time.sleep(0.002)
 
     def read(self):
         with self._lock:
@@ -255,11 +259,6 @@ def _on_result(result, output_image, timestamp_ms):
         _detection_busy = False
     del result, output_image
     _cb_count += 1
-    # Forcing a *full* collection every 100 callbacks (roughly every couple of
-    # seconds) was itself a source of visible stutter - it briefly stops the
-    # world right in the middle of gameplay. A young-generation-only sweep,
-    # done far less often, reclaims the same short-lived detection objects
-    # without the full-heap pause.
     if _cb_count % 1000 == 0:
         gc.collect(0)
 
@@ -277,37 +276,11 @@ def _make_hand_options(delegate):
 
 
 _delegate = python.BaseOptions.Delegate.GPU
-_last_detector_refresh = time.time()
-_refreshing_detector = False
 
 
 def refresh_detector():
-    """Rebuilds the hand-tracking model. Loading a model from disk can take a
-    noticeable chunk of a second (much more on a Jetson Nano's CPU fallback),
-    and this used to run directly on the render/game-loop thread - which meant
-    the whole game visibly froze for a moment every time a level loaded and
-    again every ~75s during play. It now runs on a background thread so the
-    game keeps rendering at full speed while the swap happens invisibly."""
-    global _refreshing_detector
-    if _refreshing_detector:
-        return
-    _refreshing_detector = True
-
-    def worker():
-        global detector, _last_detector_refresh, _refreshing_detector
-        try:
-            new_detector = vision.HandLandmarker.create_from_options(_make_hand_options(_delegate))
-            with _result_lock:
-                old_detector = detector
-                detector = new_detector
-            old_detector.close()
-            _last_detector_refresh = time.time()
-        except Exception as e:
-            print(f"[detector] Refresh error: {e}")
-        finally:
-            _refreshing_detector = False
-
-    threading.Thread(target=worker, daemon=True).start()
+    """No-op: Rebuilding detector mid-game caused severe CPU contention and lag."""
+    pass
 
 
 try:
@@ -435,39 +408,73 @@ def remap_cursor_norm(v, margin=CURSOR_EDGE_MARGIN):
     return min(1.0, max(0.0, (v - margin) / span))
 
 
-# Sticky hysteresis margin: once a tube is the active drop target, its
-# hit zone expands by this many pixels on each side so minor tremor
-# doesn't flick the selection to a neighbouring tube.
-TUBE_MAGNET_PX = 22
-
-
 def find_hovered_tube(hx, hy, tube_rects, sticky_idx=None):
     """Finds hovered tube using continuous mid-gap Voronoi boundaries
     and generous vertical tolerance. Eliminates all dead zones between narrow tubes.
     When sticky_idx is provided (the tube the player is currently targeting),
-    that tube's boundaries are expanded by TUBE_MAGNET_PX so it 'holds on'
-    even through minor hand tremor."""
+    that tube's boundaries are expanded by an adaptive magnet distance so it
+    doesn't capture neighboring tubes when tubes are narrow."""
     if not tube_rects:
         return None
-    top_limit = 110
-    bottom_limit = tube_rects[0].bottom + 50
+    top_limit = 60
+    bottom_limit = HEIGHT - 20
     if not (top_limit <= hy <= bottom_limit):
         return None
 
-    # Check the sticky tube first with expanded boundaries
+    # Adaptive magnet hysteresis based on actual spacing between tubes
+    if len(tube_rects) > 1:
+        actual_gap = tube_rects[1].left - tube_rects[0].right
+        magnet_px = max(5, min(14, int(actual_gap * 0.45)))
+    else:
+        magnet_px = 16
+
+    # Check the sticky tube first with adaptive boundaries
     if sticky_idx is not None and 0 <= sticky_idx < len(tube_rects):
         rect = tube_rects[sticky_idx]
-        left_limit = (tube_rects[sticky_idx - 1].right + rect.left) / 2 if sticky_idx > 0 else rect.left - 40
-        right_limit = (rect.right + tube_rects[sticky_idx + 1].left) / 2 if sticky_idx < len(tube_rects) - 1 else rect.right + 40
-        if (left_limit - TUBE_MAGNET_PX) <= hx <= (right_limit + TUBE_MAGNET_PX):
+        left_limit = (tube_rects[sticky_idx - 1].right + rect.left) / 2 if sticky_idx > 0 else rect.left - int(rect.width * 0.7)
+        right_limit = (rect.right + tube_rects[sticky_idx + 1].left) / 2 if sticky_idx < len(tube_rects) - 1 else rect.right + int(rect.width * 0.7)
+        if (left_limit - magnet_px) <= hx <= (right_limit + magnet_px):
             return sticky_idx
 
     for idx, rect in enumerate(tube_rects):
-        left_limit = (tube_rects[idx - 1].right + rect.left) / 2 if idx > 0 else rect.left - 40
-        right_limit = (rect.right + tube_rects[idx + 1].left) / 2 if idx < len(tube_rects) - 1 else rect.right + 40
+        left_limit = (tube_rects[idx - 1].right + rect.left) / 2 if idx > 0 else rect.left - int(rect.width * 0.7)
+        right_limit = (rect.right + tube_rects[idx + 1].left) / 2 if idx < len(tube_rects) - 1 else rect.right + int(rect.width * 0.7)
         if left_limit <= hx <= right_limit:
             return idx
     return None
+
+
+def find_nearest_tube(hx, hy, tube_rects):
+    """Fallback to find the closest tube column to the cursor on release."""
+    if not tube_rects:
+        return None
+    best_idx = None
+    min_dist = float('inf')
+    for idx, rect in enumerate(tube_rects):
+        dist = abs(hx - rect.centerx)
+        if dist < min_dist:
+            min_dist = dist
+            best_idx = idx
+    if best_idx is not None:
+        rect = tube_rects[best_idx]
+        reach = rect.width * 1.3
+        if rect.left - reach <= hx <= rect.right + reach:
+            return best_idx
+    return None
+
+
+def get_drop_validation(tube_idx, tubes_data, carried_color, source_idx=None):
+    """Evaluates whether dropping carried_color into tubes_data[tube_idx] is allowed."""
+    if tube_idx is None or tube_idx < 0 or tube_idx >= len(tubes_data):
+        return 'none', "No tube selected"
+    if tube_idx == source_idx:
+        return 'same_source', "Return ball"
+    t_balls = tubes_data[tube_idx]
+    if len(t_balls) >= TUBE_CAPACITY:
+        return 'full', "Tube is full (max 4)"
+    if t_balls and t_balls[-1] != carried_color:
+        return 'mismatch', "Color mismatch"
+    return 'valid', "Drop here"
 
 
 # ============================================================
@@ -475,23 +482,23 @@ def find_hovered_tube(hx, hy, tube_rects, sticky_idx=None):
 # ============================================================
 def compute_layout(num_tubes):
     """Returns (tube_width, gap, ball_radius, tube_height, tube_rects) sized to fit WIDTH."""
-    margin = 40
+    margin = 35
     available_width = WIDTH - margin * 2
     gap_ratio = 0.35
     max_tube_width = 84
-    min_tube_width = 30
+    min_tube_width = 34
 
     denom = num_tubes + gap_ratio * (num_tubes - 1)
     tube_width = available_width / denom
     tube_width = max(min_tube_width, min(max_tube_width, tube_width))
     gap = tube_width * gap_ratio
 
-    ball_radius = max(9, int(tube_width * 0.31))
-    tube_height = TUBE_CAPACITY * ball_radius * 2 + 40
+    ball_radius = max(11, int(tube_width * 0.32))
+    tube_height = TUBE_CAPACITY * ball_radius * 2 + 42
 
     total_width = num_tubes * tube_width + (num_tubes - 1) * gap
     start_x = (WIDTH - total_width) / 2
-    tube_y = 300
+    tube_y = 290
 
     rects = []
     for i in range(num_tubes):
@@ -539,27 +546,40 @@ def ease_out_cubic(t):
     return 1 - pow(1 - t, 3)
 
 
+_ball_surface_cache = {}
+
+
+def get_ball_surface(color, radius):
+    key = (color, radius)
+    s = _ball_surface_cache.get(key)
+    if s is None:
+        size = radius * 2 + 6
+        s = pygame.Surface((size, size), pygame.SRCALPHA)
+        cx, cy = size // 2, size // 2
+        pygame.draw.circle(s, darken(color, 0.28), (cx, cy), radius)
+        pygame.draw.circle(s, color, (cx, cy), radius - 2)
+        pygame.draw.circle(s, lighten(color, 0.55), (cx - radius // 3, cy - radius // 3), max(3, radius // 3))
+        pygame.draw.circle(s, (255, 255, 255), (cx - radius // 2, cy - radius // 2), max(2, radius // 6))
+        _ball_surface_cache[key] = s
+    return s
+
+
 def draw_ball(surf, color, x, y, radius, alpha=255):
     x, y = int(x), int(y)
+    ball_surf = get_ball_surface(color, radius)
+    offset = ball_surf.get_width() // 2
     if alpha >= 255:
         pygame.draw.ellipse(surf, (0, 0, 0, 70),
                              pygame.Rect(x - radius - 2, y + radius - 8, radius * 2 + 4, 10))
-        pygame.draw.circle(surf, darken(color, 0.28), (x, y), radius)
-        pygame.draw.circle(surf, color, (x, y), radius - 2)
-        pygame.draw.circle(surf, lighten(color, 0.55), (x - radius // 3, y - radius // 3), max(3, radius // 3))
-        pygame.draw.circle(surf, (255, 255, 255), (x - radius // 2, y - radius // 2), max(2, radius // 6))
+        surf.blit(ball_surf, (x - offset, y - offset))
     else:
-        temp = pygame.Surface((radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA)
-        cx, cy = radius + 2, radius + 2
-        pygame.draw.circle(temp, darken(color, 0.28), (cx, cy), radius)
-        pygame.draw.circle(temp, color, (cx, cy), radius - 2)
-        pygame.draw.circle(temp, lighten(color, 0.55), (cx - radius // 3, cy - radius // 3), max(3, radius // 3))
+        temp = ball_surf.copy()
         temp.set_alpha(alpha)
-        surf.blit(temp, (x - cx, y - cy))
+        surf.blit(temp, (x - offset, y - offset))
 
 
 _tube_glass_cache = {}
-_tube_glow_cache = {}
+_tube_status_glow_cache = {}
 
 
 def _get_tube_glass(w, h):
@@ -573,34 +593,44 @@ def _get_tube_glass(w, h):
     return s
 
 
-def _get_tube_glow(w, h):
-    key = (w, h)
-    s = _tube_glow_cache.get(key)
+def _get_tube_glow_surf(w, h, glow_color):
+    key = (w, h, glow_color)
+    s = _tube_status_glow_cache.get(key)
     if s is None:
-        s = pygame.Surface((w + 30, h + 20), pygame.SRCALPHA)
-        pygame.draw.rect(s, (*TUBE_BORDER_ACTIVE, 40), s.get_rect(), border_radius=24)
-        _tube_glow_cache[key] = s
+        s = pygame.Surface((w + 26, h + 20), pygame.SRCALPHA)
+        pygame.draw.rect(s, (*glow_color, 45), s.get_rect(), border_radius=22)
+        pygame.draw.rect(s, (*glow_color, 90), s.get_rect(), width=2, border_radius=22)
+        _tube_status_glow_cache[key] = s
     return s
 
 
-def draw_tube(surf, rect, active):
-    # Glass + glow are the same pixels every frame for a given tube size, so they're
-    # built once per size and reused instead of allocating+filling a new
-    # per-pixel-alpha Surface on every single frame for every tube (was the
-    # single biggest render-loop cost at 13 tubes x 60fps).
+def draw_tube(surf, rect, status=None):
+    """Draws tube with glass body and status-aware glow/border:
+    status: None (normal), 'active' (cyan), 'valid' (emerald green), 'invalid' (crimson red)"""
     surf.blit(_get_tube_glass(rect.width, rect.height), rect.topleft)
 
-    border_color = TUBE_BORDER_ACTIVE if active else TUBE_BORDER
-    width = 6 if active else 4
-    if active:
-        # Gentle breathing pulse via set_alpha directly on the cached surface.
-        # Mutating the cached surface's alpha is safe because every tube that
-        # draws the glow in this frame uses the same alpha anyway, and the
-        # surface is reset each frame. Eliminates the per-frame .copy() alloc.
-        pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() / 220.0))
-        glow = _get_tube_glow(rect.width, rect.height)
-        glow.set_alpha(int(160 + 95 * pulse))
-        surf.blit(glow, (rect.x - 15, rect.y - 10))
+    if status == 'valid':
+        border_color = (50, 245, 140)
+        glow_color = (40, 240, 130)
+        width = 6
+    elif status == 'invalid':
+        border_color = (255, 70, 80)
+        glow_color = (245, 50, 60)
+        width = 6
+    elif status == 'active':
+        border_color = TUBE_BORDER_ACTIVE
+        glow_color = TUBE_BORDER_ACTIVE
+        width = 6
+    else:
+        border_color = TUBE_BORDER
+        glow_color = None
+        width = 4
+
+    if glow_color is not None:
+        pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() / 180.0))
+        glow = _get_tube_glow_surf(rect.width, rect.height, glow_color)
+        glow.set_alpha(int(150 + 105 * pulse))
+        surf.blit(glow, (rect.x - 13, rect.y - 10))
 
     pygame.draw.lines(surf, border_color, False, [
         (rect.left, rect.top),
@@ -612,6 +642,68 @@ def draw_tube(surf, rect, active):
     ], width=width)
 
 
+def draw_tube_badge(surf, rect, text, bg_color, border_color, icon=""):
+    full_text = f"{icon} {text}".strip()
+    txt_surf = FONT_SMALL.render(full_text, True, (255, 255, 255))
+    bw, bh = txt_surf.get_width() + 18, 24
+    bx = rect.centerx - bw // 2
+    by = rect.top - bh - 8
+
+    bg_s = pygame.Surface((bw, bh), pygame.SRCALPHA)
+    pygame.draw.rect(bg_s, (*bg_color, 220), bg_s.get_rect(), border_radius=12)
+    pygame.draw.rect(bg_s, (*border_color, 255), bg_s.get_rect(), width=2, border_radius=12)
+    bg_s.blit(txt_surf, (9, (bh - txt_surf.get_height()) // 2))
+    surf.blit(bg_s, (bx, by))
+
+
+shaking_tubes = {}
+floating_toasts = []
+
+
+def trigger_tube_shake(tube_idx):
+    if tube_idx is not None:
+        shaking_tubes[tube_idx] = {
+            "t0": pygame.time.get_ticks(),
+            "duration_ms": 260
+        }
+
+
+def add_toast(text, x, y, color=(255, 80, 80)):
+    x = max(130, min(WIDTH - 130, int(x)))
+    y = max(90, min(HEIGHT - 60, int(y)))
+    floating_toasts.append({
+        "text": text,
+        "x": x,
+        "y": y,
+        "t0": pygame.time.get_ticks(),
+        "duration_ms": 1300,
+        "color": color
+    })
+
+
+def update_and_draw_toasts(surf):
+    now = pygame.time.get_ticks()
+    alive = []
+    for toast in floating_toasts:
+        elapsed = now - toast["t0"]
+        if elapsed < toast["duration_ms"]:
+            alive.append(toast)
+            progress = elapsed / toast["duration_ms"]
+            cur_y = toast["y"] - int(progress * 32)
+            alpha = int(255 * (1.0 - max(0.0, (progress - 0.4) / 0.6)))
+
+            txt_s = FONT_BTN_SUB.render(toast["text"], True, (255, 255, 255))
+            pad_x, pad_y = 14, 6
+            tw, th = txt_s.get_width() + pad_x * 2, txt_s.get_height() + pad_y * 2
+            toast_surf = pygame.Surface((tw, th), pygame.SRCALPHA)
+            pygame.draw.rect(toast_surf, (*toast["color"], min(235, alpha)), toast_surf.get_rect(), border_radius=12)
+            pygame.draw.rect(toast_surf, (255, 255, 255, min(220, alpha)), toast_surf.get_rect(), width=2, border_radius=12)
+            txt_s.set_alpha(alpha)
+            toast_surf.blit(txt_s, (pad_x, pad_y))
+            surf.blit(toast_surf, (toast["x"] - tw // 2, cur_y - th // 2))
+    floating_toasts[:] = alive
+
+
 def slot_position(rect, slot_idx, radius):
     x = rect.centerx
     y = rect.bottom - (slot_idx * (radius * 2)) - radius - 5
@@ -619,6 +711,8 @@ def slot_position(rect, slot_idx, radius):
 
 
 _THUMB_SURF = pygame.Surface((THUMB_WIDTH, THUMB_HEIGHT))
+_THUMB_CONTAINER = pygame.Surface((THUMB_WIDTH, THUMB_HEIGHT), pygame.SRCALPHA)
+_THUMB_BORDER = pygame.Surface((THUMB_WIDTH, THUMB_HEIGHT), pygame.SRCALPHA)
 
 
 def draw_thumbnail(surf, rgb_small, landmark_pt, pos=None, cursor_near=False):
@@ -628,26 +722,26 @@ def draw_thumbnail(surf, rgb_small, landmark_pt, pos=None, cursor_near=False):
         box_x, box_y = pos
     alpha = 75 if cursor_near else 235
 
-    container = pygame.Surface((THUMB_WIDTH, THUMB_HEIGHT), pygame.SRCALPHA)
+    _THUMB_CONTAINER.fill((0, 0, 0, 0))
     if rgb_small is not None:
         pygame.surfarray.blit_array(_THUMB_SURF, np.transpose(rgb_small, (1, 0, 2)))
-        container.blit(_THUMB_SURF, (0, 0))
+        _THUMB_CONTAINER.blit(_THUMB_SURF, (0, 0))
         if landmark_pt is not None:
             lx = landmark_pt[0] * THUMB_WIDTH
             ly = landmark_pt[1] * THUMB_HEIGHT
-            pygame.draw.circle(container, ACCENT, (int(lx), int(ly)), 4)
+            pygame.draw.circle(_THUMB_CONTAINER, ACCENT, (int(lx), int(ly)), 4)
     else:
-        container.fill((25, 20, 42))
+        _THUMB_CONTAINER.fill((25, 20, 42))
 
-    container.set_alpha(alpha)
-    surf.blit(container, (box_x, box_y))
+    _THUMB_CONTAINER.set_alpha(alpha)
+    surf.blit(_THUMB_CONTAINER, (box_x, box_y))
 
-    border_surf = pygame.Surface((THUMB_WIDTH, THUMB_HEIGHT), pygame.SRCALPHA)
-    pygame.draw.rect(border_surf, (*TUBE_BORDER, alpha), border_surf.get_rect(), width=2, border_radius=8)
-    pygame.draw.rect(border_surf, (15, 12, 28, min(alpha, 200)), (4, 4, 32, 16), border_radius=4)
+    _THUMB_BORDER.fill((0, 0, 0, 0))
+    pygame.draw.rect(_THUMB_BORDER, (*TUBE_BORDER, alpha), _THUMB_BORDER.get_rect(), width=2, border_radius=8)
+    pygame.draw.rect(_THUMB_BORDER, (15, 12, 28, min(alpha, 200)), (4, 4, 32, 16), border_radius=4)
     badge = FONT_SMALL.render("CAM", True, (215, 215, 235))
-    border_surf.blit(badge, (7, 4))
-    surf.blit(border_surf, (box_x, box_y))
+    _THUMB_BORDER.blit(badge, (7, 4))
+    surf.blit(_THUMB_BORDER, (box_x, box_y))
 
 
 # ============================================================
@@ -753,6 +847,9 @@ def apply_theme(theme_key):
 
     MENU_BUTTON_ART = _build_menu_button_art()
     MENU_GLOW = _build_menu_glow(175, 100)
+    _tube_glass_cache.clear()
+    _tube_status_glow_cache.clear()
+    _ball_surface_cache.clear()
 
 
 def draw_action_button(surf, rect, label, icon, is_hover=False, active=False):
@@ -1186,7 +1283,6 @@ def load_level(idx):
     global current_level_idx, tubes_data, tube_rects, cur_ball_radius, cur_tube_height
     global selected_ball_color, source_tube_idx, drop_animations, moves, game_won, all_levels_complete
     global level_intro_start, level_intro_active
-    refresh_detector()
     current_level_idx = idx
     cfg = LEVELS[idx]
     _, _, cur_ball_radius, cur_tube_height, tube_rects = compute_layout(cfg["tubes"])
@@ -1194,6 +1290,8 @@ def load_level(idx):
     selected_ball_color = None
     source_tube_idx = None
     drop_animations = {}
+    shaking_tubes.clear()
+    floating_toasts.clear()
     moves = 0
     game_won = False
     all_levels_complete = False
@@ -1252,7 +1350,6 @@ while running:
                     is_pinching = False
                     prev_cursor_found = False
                     pygame.event.clear()
-                    refresh_detector()
                 elif event.key == pygame.K_n and game_won:
                     if current_level_idx + 1 < len(LEVELS):
                         load_level(current_level_idx + 1)
@@ -1278,8 +1375,6 @@ while running:
         with _result_lock:
             busy = _detection_busy
         if not busy:
-            if time.time() - _last_detector_refresh > 75 and selected_ball_color is None:
-                refresh_detector()
             det_bgr = cv2.resize(frame, (DET_WIDTH, DET_HEIGHT))
             cv2.cvtColor(det_bgr, cv2.COLOR_BGR2RGBA, dst=_det_buffer)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGBA, data=_det_buffer)
@@ -1456,40 +1551,39 @@ while running:
                     if hovered_tube is not None and tubes_data[hovered_tube]:
                         selected_ball_color = tubes_data[hovered_tube].pop()
                         source_tube_idx = hovered_tube
+                        last_pinch_tube = hovered_tube
                 is_pinching = True
-                # Track the pinch position and target tube continuously so that
-                # when the player opens their fingers the drop uses the LAST
-                # confirmed pinch coordinate, not the post-release flicked one.
+                # Track the pinch position continuously
                 last_pinch_hx, last_pinch_hy = hx, hy
-                last_pinch_tube = hovered_tube
+                if hovered_tube is not None:
+                    last_pinch_tube = hovered_tube
             else:
                 if is_pinching and selected_ball_color is not None:
-                    # --- RELEASE ANCHOR ---
-                    # Use the anchored pre-release position and tube, not the
-                    # current (post-finger-spread) coords which may have jumped
-                    # 30-45px into a neighbouring tube.
                     drop_hx, drop_hy = last_pinch_hx, last_pinch_hy
-                    drop_tube = last_pinch_tube
+                    drop_tube = hovered_tube if hovered_tube is not None else last_pinch_tube
+                    if drop_tube is None:
+                        drop_tube = find_nearest_tube(drop_hx, drop_hy, tube_rects)
+                    if drop_tube is None:
+                        drop_tube = find_nearest_tube(hx, hy, tube_rects)
 
-                    dropped = False
-                    if drop_tube is not None and len(tubes_data[drop_tube]) < TUBE_CAPACITY:
-                        top = tubes_data[drop_tube]
-                        if not top or top[-1] == selected_ball_color:
-                            tubes_data[drop_tube].append(selected_ball_color)
-                            rect = tube_rects[drop_tube]
-                            slot = len(tubes_data[drop_tube]) - 1
-                            end_x, end_y = slot_position(rect, slot, cur_ball_radius)
-                            drop_animations[drop_tube] = {
-                                "color": selected_ball_color,
-                                "slot": slot,
-                                "start_x": drop_hx, "start_y": drop_hy,
-                                "end_x": end_x, "end_y": end_y,
-                                "t0": pygame.time.get_ticks(),
-                            }
-                            dropped = True
-                            moves += 1
-                    if not dropped:
-                        # Smooth snap-back to source tube on invalid/canceled drop
+                    val_status, val_msg = get_drop_validation(drop_tube, tubes_data, selected_ball_color, source_tube_idx)
+
+                    if val_status == 'valid':
+                        tubes_data[drop_tube].append(selected_ball_color)
+                        rect = tube_rects[drop_tube]
+                        slot = len(tubes_data[drop_tube]) - 1
+                        end_x, end_y = slot_position(rect, slot, cur_ball_radius)
+                        drop_animations[drop_tube] = {
+                            "color": selected_ball_color,
+                            "slot": slot,
+                            "start_x": drop_hx, "start_y": drop_hy,
+                            "end_x": end_x, "end_y": end_y,
+                            "t0": pygame.time.get_ticks(),
+                            "duration_ms": DROP_ANIM_MS,
+                            "is_return": False,
+                        }
+                        moves += 1
+                    elif val_status == 'same_source':
                         rect = tube_rects[source_tube_idx]
                         tubes_data[source_tube_idx].append(selected_ball_color)
                         slot = len(tubes_data[source_tube_idx]) - 1
@@ -1500,6 +1594,33 @@ while running:
                             "start_x": drop_hx, "start_y": drop_hy,
                             "end_x": end_x, "end_y": end_y,
                             "t0": pygame.time.get_ticks(),
+                            "duration_ms": 220,
+                            "is_return": False,
+                        }
+                    else:
+                        if drop_tube is not None:
+                            trigger_tube_shake(drop_tube)
+                            if val_status == 'full':
+                                add_toast("✕ Tube Full! (Max 4)", drop_hx, drop_hy - 15, color=(255, 60, 60))
+                            elif val_status == 'mismatch':
+                                add_toast("✕ Color Mismatch! Must match top ball", drop_hx, drop_hy - 15, color=(255, 95, 40))
+                            else:
+                                add_toast("✕ Invalid Move!", drop_hx, drop_hy - 15, color=(240, 120, 50))
+                        else:
+                            add_toast("✕ Drop inside a tube!", drop_hx, drop_hy - 15, color=(240, 160, 40))
+
+                        rect = tube_rects[source_tube_idx]
+                        tubes_data[source_tube_idx].append(selected_ball_color)
+                        slot = len(tubes_data[source_tube_idx]) - 1
+                        end_x, end_y = slot_position(rect, slot, cur_ball_radius)
+                        drop_animations[source_tube_idx] = {
+                            "color": selected_ball_color,
+                            "slot": slot,
+                            "start_x": drop_hx, "start_y": drop_hy,
+                            "end_x": end_x, "end_y": end_y,
+                            "t0": pygame.time.get_ticks(),
+                            "duration_ms": RETURN_ANIM_MS,
+                            "is_return": True,
                         }
                     selected_ball_color = None
                     source_tube_idx = None
@@ -1517,7 +1638,10 @@ while running:
                     "start_x": hx, "start_y": hy,
                     "end_x": end_x, "end_y": end_y,
                     "t0": pygame.time.get_ticks(),
+                    "duration_ms": RETURN_ANIM_MS,
+                    "is_return": True,
                 }
+                add_toast("Hand lost - ball returned", hx, hy - 15, color=(160, 160, 200))
                 selected_ball_color = None
                 source_tube_idx = None
                 last_pinch_tube = None
@@ -1561,9 +1685,37 @@ while running:
     now_ms = pygame.time.get_ticks()
     still_animating_intro = False
 
-    for idx, rect in enumerate(tube_rects):
-        active = (hovered_tube == idx) and (selected_ball_color is not None) and (len(tubes_data[idx]) < TUBE_CAPACITY)
+    for idx, base_rect in enumerate(tube_rects):
+        shake_x = 0
+        if idx in shaking_tubes:
+            s_info = shaking_tubes[idx]
+            s_elapsed = now_ms - s_info["t0"]
+            if s_elapsed < s_info["duration_ms"]:
+                s_prog = s_elapsed / s_info["duration_ms"]
+                shake_x = int(math.sin(s_elapsed * 0.06) * 7.0 * (1.0 - s_prog))
+            else:
+                del shaking_tubes[idx]
+
+        rect = base_rect.move(shake_x, 0)
         pygame.draw.rect(screen, SHADOW_COLOR, rect, border_bottom_left_radius=20, border_bottom_right_radius=20)
+
+        tube_status = None
+        badge_info = None
+
+        if selected_ball_color is not None and hovered_tube == idx:
+            val_status, val_msg = get_drop_validation(idx, tubes_data, selected_ball_color, source_tube_idx)
+            if val_status == 'valid':
+                tube_status = 'valid'
+                badge_info = ("Drop Here", (20, 110, 55), (60, 245, 140), "✓")
+            elif val_status == 'same_source':
+                tube_status = 'active'
+                badge_info = ("Return", (35, 45, 75), (120, 145, 230), "↺")
+            elif val_status == 'full':
+                tube_status = 'invalid'
+                badge_info = ("Tube Full", (130, 25, 25), (255, 75, 75), "✕")
+            elif val_status == 'mismatch':
+                tube_status = 'invalid'
+                badge_info = ("Color Mismatch", (135, 45, 20), (255, 110, 45), "✕")
 
         anim = drop_animations.get(idx)
         skip_slot = anim["slot"] if anim else -1
@@ -1592,23 +1744,42 @@ while running:
 
             draw_ball(screen, b_color, bx, by, cur_ball_radius)
 
-        draw_tube(screen, rect, active)
+        # Draw ghost ball preview if hovered tube is a valid target
+        if tube_status == 'valid' and selected_ball_color is not None:
+            ghost_slot = len(tubes_data[idx])
+            if ghost_slot < TUBE_CAPACITY:
+                gx, gy = slot_position(rect, ghost_slot, cur_ball_radius)
+                pulse = int(140 + 75 * math.sin(now_ms / 150.0))
+                draw_ball(screen, selected_ball_color, gx, gy, cur_ball_radius, alpha=pulse)
+                pygame.draw.circle(screen, (50, 245, 140), (int(gx), int(gy)), cur_ball_radius + 3, width=2)
+
+        draw_tube(screen, rect, tube_status)
+
+        if badge_info is not None:
+            draw_tube_badge(screen, rect, badge_info[0], badge_info[1], badge_info[2], badge_info[3])
 
     if level_intro_active and not still_animating_intro:
         level_intro_active = False
 
-    # animate the ball currently dropping into place
+    # animate the ball currently dropping into place or returning
     finished = []
     for idx, anim in drop_animations.items():
-        elapsed = pygame.time.get_ticks() - anim["t0"]
-        t = ease_out_cubic(elapsed / DROP_ANIM_MS)
-        cx = anim["start_x"] + (anim["end_x"] - anim["start_x"]) * t
-        cy = anim["start_y"] + (anim["end_y"] - anim["start_y"]) * t
+        elapsed = now_ms - anim["t0"]
+        dur = anim.get("duration_ms", DROP_ANIM_MS)
+        t = min(1.0, elapsed / dur)
+        e = ease_out_cubic(t)
+        cx = anim["start_x"] + (anim["end_x"] - anim["start_x"]) * e
+        cy = anim["start_y"] + (anim["end_y"] - anim["start_y"]) * e
+        if anim.get("is_return"):
+            cy -= int(50.0 * math.sin(t * math.pi))
         draw_ball(screen, anim["color"], cx, cy, cur_ball_radius)
-        if elapsed >= DROP_ANIM_MS:
+        if elapsed >= dur:
             finished.append(idx)
     for idx in finished:
         del drop_animations[idx]
+
+    # Draw floating toast alerts
+    update_and_draw_toasts(screen)
 
     if show_camera_preview:
         cursor_near = (hx >= WIDTH - THUMB_WIDTH - 35 and hy <= 12 + THUMB_HEIGHT + 35)
